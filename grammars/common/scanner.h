@@ -88,11 +88,15 @@ static bool scan_automatic_semicolon(TSLexer *lexer, const bool *valid_symbols, 
             return true;
         }
         if (lexer->lookahead == '}') {
+            // Automatic semicolon insertion breaks detection of object patterns
+            // in a typed context:
+            //   type F = ({a}: {a: number}) => number;
+            // Therefore, disable automatic semicolons when followed by typing
             do {
                 skip(lexer);
             } while (iswspace(lexer->lookahead));
             if (lexer->lookahead == ':') {
-                return valid_symbols[LOGICAL_OR];
+                return valid_symbols[LOGICAL_OR]; // Don't return false if we're in a ternary by checking if || is valid
             }
             return true;
         }
@@ -135,6 +139,9 @@ static bool scan_automatic_semicolon(TSLexer *lexer, const bool *valid_symbols, 
             }
             break;
 
+            // Don't insert a semicolon before a '[' or '(', unless we're parsing
+            // a type. Detect whether we're parsing a type or an expression using
+            // the validity of a binary operator token.
         case '(':
         case '[':
             if (valid_symbols[LOGICAL_OR]) {
@@ -142,6 +149,7 @@ static bool scan_automatic_semicolon(TSLexer *lexer, const bool *valid_symbols, 
             }
             break;
 
+            // Insert a semicolon before `--` and `++`, but not before binary `+` or `-`.
         case '+':
             skip(lexer);
             return lexer->lookahead == '+';
@@ -149,10 +157,13 @@ static bool scan_automatic_semicolon(TSLexer *lexer, const bool *valid_symbols, 
             skip(lexer);
             return lexer->lookahead == '-';
 
+            // Don't insert a semicolon before `!=`, but do insert one before a unary `!`.
         case '!':
             skip(lexer);
             return lexer->lookahead != '=';
 
+            // Don't insert a semicolon before `in` or `instanceof`, but do insert one
+            // before an identifier.
         case 'i':
             skip(lexer);
 
@@ -192,6 +203,7 @@ static bool scan_ternary_qmark(TSLexer *lexer) {
     if (lexer->lookahead == '?') {
         advance(lexer);
 
+        /* Optional chaining. */
         if (lexer->lookahead == '?' || lexer->lookahead == '.') {
             return false;
         }
@@ -199,6 +211,8 @@ static bool scan_ternary_qmark(TSLexer *lexer) {
         lexer->mark_end(lexer);
         lexer->result_symbol = TERNARY_QMARK;
 
+        /* TypeScript optional arguments contain the ?: sequence, possibly
+           with whitespace. */
         for (;;) {
             if (!iswspace(lexer->lookahead)) {
                 break;
@@ -260,7 +274,11 @@ static bool scan_closing_comment(TSLexer *lexer) {
 }
 
 static bool scan_jsx_text(TSLexer *lexer) {
+    // saw_text will be true if we see any non-whitespace content, or any whitespace content that is not a newline and
+    // does not immediately follow a newline.
     bool saw_text = false;
+    // at_newline will be true if we are currently at a newline, or if we are at whitespace that is not a newline but
+    // immediately follows a newline.
     bool at_newline = false;
 
     while (lexer->lookahead != 0 && lexer->lookahead != '<' && lexer->lookahead != '>' && lexer->lookahead != '{' &&
@@ -269,6 +287,20 @@ static bool scan_jsx_text(TSLexer *lexer) {
         if (lexer->lookahead == '\n') {
             at_newline = true;
         } else {
+            // If at_newline is already true, and we see some whitespace, then it must stay true.
+            // Otherwise, it should be false.
+            //
+            // See the table below to determine the logic for computing `saw_text`.
+            //
+            // |------------------------------------|
+            // | at_newline | is_wspace | saw_text  |
+            // |------------|-----------|-----------|
+            // | false (0)  | false (0) | true  (1) |
+            // | false (0)  | true  (1) | true  (1) |
+            // | true  (1)  | false (0) | true  (1) |
+            // | true  (1)  | true  (1) | false (0) |
+            // |------------------------------------|
+
             at_newline &= is_wspace;
             if (!at_newline) {
                 saw_text = true;

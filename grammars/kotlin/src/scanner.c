@@ -14,6 +14,8 @@ enum TokenType {
   STRING_START,
   STRING_END,
   STRING_CONTENT,
+  PRIMARY_CONSTRUCTOR_KEYWORD,
+  IMPORT_DOT,
 };
 
 /* Pretty much all of this code is taken from the Julia tree-sitter
@@ -233,19 +235,65 @@ static bool scan_multiline_comment(TSLexer *lexer) {
 
 static bool scan_whitespace_and_comments(TSLexer *lexer) {
   while (iswspace(lexer->lookahead)) skip(lexer);
-  return lexer->lookahead != '/';
+  return true;
 }
 
+// Test for any identifier character other than the first character.
+// This is meant to match the regexp [\p{L}_\p{Nd}]
+// as found in '_alpha_identifier' (see grammar.js).
+static bool is_word_char(int32_t c) {
+  return (iswalnum(c) || c == '_');
+}
+
+// Scan for [the end of] a nonempty alphanumeric identifier or
+// alphanumeric keyword (including '_').
 static bool scan_for_word(TSLexer *lexer, const char* word, unsigned len) {
     skip(lexer);
     for (unsigned i = 0; i < len; ++i) {
       if (lexer->lookahead != word[i]) return false;
       skip(lexer);
     }
+    // check that the identifier stops here
+    if (is_word_char(lexer->lookahead)) return false;
     return true;
 }
 
-static bool scan_automatic_semicolon(TSLexer *lexer) {
+// Check if a sequence of characters matches the given word and is followed
+// by a non-word character. Uses skip() so characters are not included in
+// the current token.
+static bool check_word(TSLexer *lexer, const char *word, unsigned len) {
+  for (unsigned i = 0; i < len; i++) {
+    if (lexer->lookahead != word[i]) return false;
+    skip(lexer);
+  }
+  return !is_word_char(lexer->lookahead);
+}
+
+// Check if the current position has a visibility modifier (public, private,
+// protected, internal) followed by horizontal whitespace and "constructor".
+// Uses skip() — safe to call speculatively since no token boundary is changed.
+static bool check_modifier_then_constructor(TSLexer *lexer) {
+  // Buffer the first word to identify the modifier
+  char word[20];
+  unsigned len = 0;
+  while (is_word_char(lexer->lookahead) && len < 19) {
+    word[len++] = (char)lexer->lookahead;
+    skip(lexer);
+  }
+  word[len] = '\0';
+
+  if (strcmp(word, "public") != 0 && strcmp(word, "private") != 0 &&
+      strcmp(word, "protected") != 0 && strcmp(word, "internal") != 0) {
+    return false;
+  }
+
+  // Skip horizontal whitespace (not newlines)
+  while (lexer->lookahead == ' ' || lexer->lookahead == '\t') skip(lexer);
+
+  return check_word(lexer, "constructor", 11);
+}
+
+static bool scan_automatic_semicolon(TSLexer *lexer, const bool *valid_symbols) {
   lexer->result_symbol = AUTOMATIC_SEMICOLON;
   lexer->mark_end(lexer);
 
@@ -285,10 +333,8 @@ static bool scan_automatic_semicolon(TSLexer *lexer) {
 
   if (sameline) {
     switch (lexer->lookahead) {
-      // Don't insert a semicolon before an else
-      case 'e':
-        return !scan_for_word(lexer, "lse", 3);
-
+      // Insert imaginary semicolon before an 'import' but not in front
+      // of other words or keywords starting with 'i'
       case 'i':
         return scan_for_word(lexer, "mport", 5);
 
@@ -297,6 +343,7 @@ static bool scan_automatic_semicolon(TSLexer *lexer) {
         lexer->mark_end(lexer);
         return true;
 
+      // Don't insert a semicolon in other cases
       default:
         return false;
     }
@@ -317,7 +364,13 @@ static bool scan_automatic_semicolon(TSLexer *lexer) {
     case '?':
     case '|':
     case '&':
+      return false;
+
+    // Don't insert a semicolon before `/` (division), but do insert one before
+    // `//` (line comment) and `/*` (block comment).
     case '/':
+      skip(lexer);
+      if (lexer->lookahead == '/' || lexer->lookahead == '*') return true;
       return false;
 
     // Insert a semicolon before `--` and `++`, but not before binary `+` or `-`.
@@ -341,14 +394,61 @@ static bool scan_automatic_semicolon(TSLexer *lexer) {
     case 'e':
       return !scan_for_word(lexer, "lse", 3);
 
-    // Don't insert a semicolon before `in` or `instanceof`, but do insert one
-    // before an identifier or an import.
+    // Don't insert a semicolon before an as
+    case 'a':
+      return !scan_for_word(lexer, "s", 1);
+
+    // Don't insert a semicolon before a where
+    case 'w':
+      return !scan_for_word(lexer, "here", 4);
+
+    // Don't insert a semicolon before `instanceof`, or before `internal`
+    // when followed by `constructor` in a class declaration context.
     case 'i':
-      skip(lexer);
-      if (lexer->lookahead != 'n') return true;
-      skip(lexer);
-      if (!iswalpha(lexer->lookahead)) return false;
-      return !scan_for_word(lexer, "stanceof", 8);
+      if (valid_symbols[PRIMARY_CONSTRUCTOR_KEYWORD] &&
+          !valid_symbols[STRING_CONTENT] &&
+          check_modifier_then_constructor(lexer)) {
+        return false;
+      }
+      // Note: lexer has advanced past the word. For "instanceof", scan_for_word
+      // can no longer match. But since "instanceof" is not a Kotlin keyword
+      // (Kotlin uses "is"), this is acceptable — ASI is inserted, which is
+      // the correct behavior for any non-constructor identifier.
+      return true;
+
+    // Don't insert a semicolon before `public/private/protected constructor`
+    // in class declaration context.
+    case 'p':
+      if (valid_symbols[PRIMARY_CONSTRUCTOR_KEYWORD] &&
+          !valid_symbols[STRING_CONTENT] &&
+          check_modifier_then_constructor(lexer)) {
+        return false;
+      }
+      return true;
+
+    // Don't insert a semicolon before `constructor` if the parser expects
+    // a primary constructor (class declaration context). In class body
+    // context, PRIMARY_CONSTRUCTOR_KEYWORD won't be valid, so ASI is
+    // inserted normally before secondary constructors.
+    // Guard against error recovery mode where all symbols are valid.
+    // Instead of suppressing ASI, we emit the constructor keyword directly
+    // since it's an external token and the internal lexer won't match it.
+    case 'c':
+      if (valid_symbols[PRIMARY_CONSTRUCTOR_KEYWORD] &&
+          !valid_symbols[STRING_CONTENT]) {
+        const char *kw = "constructor";
+        bool matched = true;
+        for (unsigned i = 0; i < 11; i++) {
+          if (lexer->lookahead != kw[i]) { matched = false; break; }
+          advance(lexer);
+        }
+        if (matched && !is_word_char(lexer->lookahead)) {
+          lexer->result_symbol = PRIMARY_CONSTRUCTOR_KEYWORD;
+          lexer->mark_end(lexer);
+          return true;
+        }
+      }
+      return true;
 
     case ';':
       advance(lexer);
@@ -453,14 +553,49 @@ static bool scan_import_list_delimiter(TSLexer *lexer) {
       default:
         return true;
     }
-
-    return false;
   }
+}
+
+// Scan a dot in import identifiers. Matches '.' normally, but when the dot
+// is followed by a newline and then the 'import' keyword, produces an
+// AUTOMATIC_SEMICOLON (zero-width, before the dot) instead. This cleanly
+// terminates the current import_header, preventing malformed imports
+// (e.g. trailing dots) from bleeding into subsequent valid imports.
+static bool scan_import_dot(TSLexer *lexer) {
+  if (lexer->lookahead != '.') return false;
+
+  // Mark end BEFORE consuming the dot — this is where ASI would go
+  lexer->mark_end(lexer);
+
+  advance(lexer);
+
+  // Peek ahead: skip horizontal whitespace, check for newline
+  bool found_newline = false;
+  while (iswspace(lexer->lookahead)) {
+    if (lexer->lookahead == '\n' || lexer->lookahead == '\r') {
+      found_newline = true;
+    }
+    skip(lexer);
+  }
+
+  if (found_newline && lexer->lookahead == 'i' &&
+      scan_for_word(lexer, "mport", 5)) {
+    // Trailing dot followed by 'import' on next line — produce ASI
+    // instead of the dot. mark_end was set before the dot, so the
+    // semicolon is zero-width at that position.
+    lexer->result_symbol = AUTOMATIC_SEMICOLON;
+    return true;
+  }
+
+  // Normal dot — include it in the token
+  lexer->result_symbol = IMPORT_DOT;
+  lexer->mark_end(lexer);
+  return true;
 }
 
 bool tree_sitter_kotlin_external_scanner_scan(void *payload, TSLexer *lexer, const bool *valid_symbols) {
   if (valid_symbols[AUTOMATIC_SEMICOLON]) {
-    bool ret = scan_automatic_semicolon(lexer);
+    bool ret = scan_automatic_semicolon(lexer, valid_symbols);
     if (!ret && valid_symbols[SAFE_NAV] && lexer->lookahead == '?') {
       return scan_safe_nav(lexer);
     }
@@ -468,6 +603,31 @@ bool tree_sitter_kotlin_external_scanner_scan(void *payload, TSLexer *lexer, con
     // if we fail to find an automatic semicolon, it's still possible that we may
     // want to lex a string or comment later
     if (ret) return ret;
+  }
+
+  // Match dots in import identifiers, refusing dots that would cause
+  // malformed imports to bleed into subsequent import statements.
+  if (valid_symbols[IMPORT_DOT]) {
+    if (scan_import_dot(lexer)) return true;
+  }
+
+  // Match 'constructor' keyword for primary constructors when on the same line
+  // (the cross-newline case is handled inside scan_automatic_semicolon)
+  if (valid_symbols[PRIMARY_CONSTRUCTOR_KEYWORD] && !valid_symbols[STRING_CONTENT]) {
+    while (iswspace(lexer->lookahead)) skip(lexer);
+    if (lexer->lookahead == 'c') {
+      const char *kw = "constructor";
+      bool matched = true;
+      for (unsigned i = 0; i < 11; i++) {
+        if (lexer->lookahead != kw[i]) { matched = false; break; }
+        advance(lexer);
+      }
+      if (matched && !is_word_char(lexer->lookahead)) {
+        lexer->result_symbol = PRIMARY_CONSTRUCTOR_KEYWORD;
+        lexer->mark_end(lexer);
+        return true;
+      }
+    }
   }
 
   if (valid_symbols[IMPORT_LIST_DELIMITER]) {
@@ -514,7 +674,10 @@ void tree_sitter_kotlin_external_scanner_destroy(void *payload) {
 
 unsigned tree_sitter_kotlin_external_scanner_serialize(void *payload, char *buffer) {
   Stack *stack = (Stack *)payload;
-  memcpy(buffer, stack->contents, stack->size);
+  if (stack->size > 0) {
+    // it's an undefined behavior to memcpy 0 bytes
+    memcpy(buffer, stack->contents, stack->size);
+  }
   return stack->size;
 }
 

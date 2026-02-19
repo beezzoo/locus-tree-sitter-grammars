@@ -21,17 +21,16 @@ void *tree_sitter_sql_external_scanner_create() {
   return state;
 }
 
-void *tree_sitter_sql_external_scanner_destroy(void *payload) {
+void tree_sitter_sql_external_scanner_destroy(void *payload) {
   LexerState *state = (LexerState*)payload;
   if (state->start_tag != NULL) {
     free(state->start_tag);
     state->start_tag = NULL;
   }
   free(payload);
-  return NULL;
 }
 
-char* add_char(char* text, size_t* text_size, char c, int index) {
+static char* add_char(char* text, size_t* text_size, char c, int index) {
   if (text == NULL) {
     text = malloc(sizeof(char) * MALLOC_STRING_SIZE);
     *text_size = MALLOC_STRING_SIZE;
@@ -51,7 +50,7 @@ char* add_char(char* text, size_t* text_size, char c, int index) {
   return text;
 }
 
-char* scan_dollar_string_tag(TSLexer *lexer) {
+static char* scan_dollar_string_tag(TSLexer *lexer) {
   char* tag = NULL;
   int index = 0;
   size_t* text_size = malloc(sizeof(size_t));

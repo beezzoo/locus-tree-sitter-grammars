@@ -37,9 +37,6 @@ typedef struct {
   uint16_t length;
 } TSMapSlice;
 
-// Backward compatibility alias for ABI 14 grammars
-typedef TSMapSlice TSFieldMapSlice;
-
 typedef struct {
   bool visible;
   bool named;
